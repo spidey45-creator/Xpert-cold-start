@@ -15,6 +15,10 @@ import time
 import urllib.error
 from pathlib import Path
 
+import ssl
+import urllib.request
+ssl._create_default_https_context = ssl._create_unverified_context
+
 from llm import chat
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -422,7 +426,7 @@ Omit `links` and `looks_after` if empty."""
         }, ensure_ascii=False)
         return call_llm_json(system_prompt, user_prompt, max_tokens=8192)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         futures = [ex.submit(process_batch, b) for b in batches]
         for fut in concurrent.futures.as_completed(futures):
             res = fut.result() or {}
@@ -688,7 +692,7 @@ Return JSON:
         return call_llm_json(system_prompt, user_prompt, max_tokens=8192)
 
     raw_loops = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         futures = [ex.submit(process_loop_batch, b) for b in batches]
         for fut in concurrent.futures.as_completed(futures):
             res = fut.result() or {}
@@ -895,7 +899,7 @@ def main(input_dir, output_path):
     orgs, chat_ties = resolve_orgs_and_chats(chats, messages, seed, ctx)
     people = resolve_people(chats, messages, seed, ctx, orgs, chat_ties)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut_goals = ex.submit(resolve_goals, chats, messages, seed, ctx, people)
         fut_loops = ex.submit(resolve_open_loops, chats, messages, seed, ctx, people, orgs)
         goals = fut_goals.result()
