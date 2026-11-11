@@ -1,0 +1,10 @@
+data/
+*.zip
+usage.jsonl
+output.json
+out.json
+.env
+__pycache__/
+*.pyc
+.DS_Store
+prep.py
