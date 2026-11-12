@@ -1,22 +1,17 @@
-#!/usr/bin/env python3
-"""
-Xpert Cold Start Challenge — Hybrid Graph + Batched LLM Solution (OpenRouter Hardened)
-Reads <input_dir> (chats.jsonl, messages.jsonl, seed.json) and writes <output.json>.
-Standard library only + llm.py.
-"""
+﻿#!/usr/bin/env python3
 import collections
 import concurrent.futures
 import datetime
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-import ssl
-import urllib.request
 ssl._create_default_https_context = ssl._create_unverified_context
 
 from llm import chat
@@ -67,17 +62,35 @@ def parse_json_safely(text):
     return None
 
 
-def call_llm_json(system_prompt, user_prompt, max_tokens=8192):
+def call_llm_json(system_prompt, user_prompt, max_tokens=4000):
+    nl = chr(10)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt + "\n\nRespond ONLY with a valid JSON object."},
+        {"role": "user", "content": user_prompt + nl + nl + "Respond ONLY with a valid JSON object. Do not wrap in markdown."},
     ]
-    use_json_mode = True
-    for attempt in range(6):
+    base_url = os.environ.get("LLM_BASE_URL", "")
+    is_google_direct = "generativelanguage.googleapis.com" in base_url
+    primary_model = os.environ.get("LLM_MODEL", "gemini-flash-lite-latest")
+    if is_google_direct and primary_model.startswith("model-"):
+        primary_model = primary_model[len("model-"):]
+
+    fallback_models = [primary_model]
+    if is_google_direct:
+        for m in ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-3.8-flash"]:
+            if m not in fallback_models:
+                fallback_models.append(m)
+
+    use_json_mode = not is_google_direct
+
+    for attempt in range(3):
+        cur_model = fallback_models[attempt % len(fallback_models)]
         try:
+            if is_google_direct:
+                time.sleep(2.5)
             rf = {"type": "json_object"} if use_json_mode else None
             reply = chat(
                 messages,
+                model=cur_model,
                 temperature=0,
                 max_tokens=max_tokens,
                 response_format=rf,
@@ -87,17 +100,20 @@ def call_llm_json(system_prompt, user_prompt, max_tokens=8192):
             if isinstance(parsed, dict):
                 return parsed
             use_json_mode = False
+            sys.stderr.write(
+                f"[warn] Invalid or truncated JSON (model={cur_model}) "
+                f"on attempt {attempt+1}; retrying..." + nl
+            )
         except urllib.error.HTTPError as e:
-            if e.code in (400, 422) and use_json_mode:
+            if e.code in (400, 404, 422, 503) and use_json_mode:
                 use_json_mode = False
-                continue
-            wait = 4 * (attempt + 1)
-            sys.stderr.write(f"[warn] HTTP {e.code} on attempt {attempt+1}, retrying in {wait}s...\n")
+            wait = 5 * (attempt + 1)
+            sys.stderr.write(f"[warn] HTTP {e.code} (model={cur_model}) on attempt {attempt+1}, retrying in {wait}s..." + nl)
             time.sleep(wait)
         except Exception as e:
             use_json_mode = False
-            wait = 4 * (attempt + 1)
-            sys.stderr.write(f"[warn] LLM call error ({e}) on attempt {attempt+1}, retrying in {wait}s...\n")
+            wait = 5 * (attempt + 1)
+            sys.stderr.write(f"[warn] LLM call error ({e}) on attempt {attempt+1}, retrying in {wait}s..." + nl)
             time.sleep(wait)
     return {}
 
@@ -219,7 +235,7 @@ def build_context(chats, messages, seed):
 
 def format_msg_body(m, max_len=160):
     kind = m.get("kind") or "text"
-    body = (m.get("body") or "").strip().replace("\n", " ")
+    body = (m.get("body") or "").strip().replace(chr(10), " ")
     if kind == "voice_transcript":
         return f"[VOICE_TRANSCRIPT] {body[:max_len]}"
     if kind == "document" and body not in ("[document]", ""):
@@ -271,7 +287,7 @@ def resolve_orgs_and_chats(chats, messages, seed, ctx):
             "samples": sample_msgs,
         })
 
-    system_prompt = """You are an expert analyst resolving the user's ("ME") Organisations and Chat Ties from WhatsApp metadata.
+    organisation_prompt = """You are an expert analyst resolving the user's ("ME") core organisations from WhatsApp metadata.
 
 RULES FOR ORGANISATIONS:
 1. Start with the organisations named in `seed_organisations` (type="company", side="work", role="owner").
@@ -287,8 +303,27 @@ RULES FOR ORGANISATIONS:
    Valid `side`: ["home", "work"]
    Valid `role`: ["owner", "partner", "helper", "resident", "parent", "member", "other"]
 
-RULES FOR TYING CHATS:
-Every chat in the input MUST be tied to either `{"chat_id": "...", "organisation": "<org_id>"}` OR `{"chat_id": "...", "person": "<person_id>"}`:
+Return JSON: {"organisations": [{"id": "O1", "name": "...", "type": "...", "side": "...", "role": "..."}]}.
+Do not return chat ties."""
+
+    org_user_prompt = json.dumps({
+        "me_names": ctx["me_names"],
+        "likely_spouse_id": ctx["spouse_id"],
+        "seed_organisations": seed_orgs,
+        "seed_circles": seed_circles,
+        "chats": chat_summaries,
+    }, ensure_ascii=False)
+    org_result = call_llm_json(organisation_prompt, org_user_prompt, max_tokens=2000)
+    orgs = org_result.get("organisations") or []
+
+    if not orgs:
+        for i, name in enumerate(seed_orgs, 1):
+            orgs.append({"id": f"O{i}", "name": name, "type": "company", "side": "work", "role": "owner"})
+        orgs.append({"id": "O_home", "name": "Home", "type": "residence", "side": "home", "role": "owner"})
+
+    tie_prompt = """You are tying WhatsApp chats to the user's ("ME") people and core organisations.
+
+Every chat MUST be tied to either {"chat_id": "...", "organisation": "<org_id>"} OR {"chat_id": "...", "person": "<person_id>"}.
 - Group chats (`is_group: true`):
   - Work operational groups, client project groups, industry community groups (e.g. "D2C...", "D2B...", "<SeedOrg> Community"), finance/ads groups -> tie to the appropriate work `organisation`.
   - Home/household groups (Kitchen, apartment flat group, kids carpool) -> tie to `Home` organisation.
@@ -301,28 +336,28 @@ Every chat in the input MUST be tied to either `{"chat_id": "...", "organisation
     (b) It is a 1:1 chat with a contractor installing something at `Home` (like a Pickleball/basketball court vendor at ME's building -> tie to `Home`), OR
     (c) It is a 1:1 chat with a `partner` co-running a specific venture -> tie to that venture's org.
 
-Return JSON with keys:
-{
-  "organisations": [{"id": "O1", "name": "...", "type": "...", "side": "...", "role": "..."}],
-  "chats": [{"chat_id": "C01", "person": "P01"}, {"chat_id": "C03", "organisation": "O1"}]
-}"""
+Return JSON: {"chats": [{"chat_id": "C01", "person": "P01"}, {"chat_id": "C03", "organisation": "O1"}]}.
+Use only the supplied organisation IDs and chat IDs."""
 
-    user_prompt = json.dumps({
-        "me_names": ctx["me_names"],
-        "likely_spouse_id": ctx["spouse_id"],
-        "seed_organisations": seed_orgs,
-        "seed_circles": seed_circles,
-        "chats": chat_summaries,
-    }, ensure_ascii=False)
+    batch_size = 40
+    chat_batches = [chat_summaries[i:i + batch_size] for i in range(0, len(chat_summaries), batch_size)]
 
-    res = call_llm_json(system_prompt, user_prompt, max_tokens=8192)
-    orgs = res.get("organisations") or []
-    chat_ties = res.get("chats") or []
+    def process_chat_batch(batch):
+        user_prompt = json.dumps({
+            "me_names": ctx["me_names"],
+            "likely_spouse_id": ctx["spouse_id"],
+            "seed_circles": seed_circles,
+            "organisations": orgs,
+            "chats": batch,
+        }, ensure_ascii=False)
+        return call_llm_json(tie_prompt, user_prompt, max_tokens=2500)
 
-    if not orgs:
-        for i, name in enumerate(seed_orgs, 1):
-            orgs.append({"id": f"O{i}", "name": name, "type": "company", "side": "work", "role": "owner"})
-        orgs.append({"id": "O_home", "name": "Home", "type": "residence", "side": "home", "role": "owner"})
+    chat_ties = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futures = [ex.submit(process_chat_batch, batch) for batch in chat_batches]
+        for future in futures:
+            result = future.result() or {}
+            chat_ties.extend(result.get("chats") or [])
 
     return orgs, chat_ties
 
@@ -413,7 +448,7 @@ Return JSON:
 }
 Omit `links` and `looks_after` if empty."""
 
-    batch_size = 150
+    batch_size = 50
     batches = [profiles[i:i + batch_size] for i in range(0, len(profiles), batch_size)]
     people_out_map = {}
 
@@ -424,9 +459,9 @@ Omit `links` and `looks_after` if empty."""
             "organisations": orgs,
             "people_profiles": batch,
         }, ensure_ascii=False)
-        return call_llm_json(system_prompt, user_prompt, max_tokens=8192)
+        return call_llm_json(system_prompt, user_prompt, max_tokens=3000)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
         futures = [ex.submit(process_batch, b) for b in batches]
         for fut in concurrent.futures.as_completed(futures):
             res = fut.result() or {}
@@ -483,7 +518,7 @@ def resolve_goals(chats, messages, seed, ctx, people):
         body = (m.get("body") or "").strip()
         if not body or body in ("[photo]", "[video]", "[document]"):
             continue
-        if "brandwire.in" in body or "mybs.in" in body or "x.com/" in body:    
+        if "brandwire.in" in body or "mybs.in" in body or "[x.com/](https://x.com/)" in body:
             continue
         cid = m["chat_id"]
         cname = chat_by_id[cid]["name"]
@@ -532,7 +567,7 @@ Return JSON:
         "candidate_messages": goal_candidates,
     }, ensure_ascii=False)
 
-    res = call_llm_json(system_prompt, user_prompt, max_tokens=8192)
+    res = call_llm_json(system_prompt, user_prompt, max_tokens=3000)
     return res.get("goals") or []
 
 
@@ -592,8 +627,8 @@ def resolve_open_loops(chats, messages, seed, ctx, people, orgs):
         if not f_win:
             continue
 
-        if len(f_win) > 200:
-            chunk_size = 280
+        if len(f_win) > 240:
+            chunk_size = 220
             overlap = 25
             for start in range(0, len(f_win), chunk_size - overlap):
                 chunk = f_win[start:start + chunk_size]
@@ -601,7 +636,7 @@ def resolve_open_loops(chats, messages, seed, ctx, people, orgs):
                 batches.append([(cid, ctx_prefix, chunk)])
         else:
             total_len = len(f_prior) + len(f_win)
-            if current_msg_count + total_len > 450 and current_batch:
+            if current_msg_count + total_len > 380 and current_batch:
                 batches.append(current_batch)
                 current_batch = []
                 current_msg_count = 0
@@ -689,12 +724,12 @@ Return JSON:
                 "messages": formatted_msgs,
             })
         user_prompt = json.dumps({"chats": chat_payloads}, ensure_ascii=False)
-        return call_llm_json(system_prompt, user_prompt, max_tokens=8192)
+        return call_llm_json(system_prompt, user_prompt, max_tokens=4000)
 
     raw_loops = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
         futures = [ex.submit(process_loop_batch, b) for b in batches]
-        for fut in concurrent.futures.as_completed(futures):
+        for fut in futures:
             res = fut.result() or {}
             for lp in res.get("open_loops") or []:
                 if isinstance(lp, dict) and lp.get("source_msg"):
