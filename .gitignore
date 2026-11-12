@@ -8,3 +8,11 @@ __pycache__/
 *.pyc
 .DS_Store
 prep.py
+test_llm.py
+diag.py
+diag1.py
+diag2.py
+diag3.py
+patch_loops.py
+run.log
+solution.py.bak2
